@@ -39,24 +39,32 @@ function supportedVersion(value: unknown): SupportedSessionFormatVersion {
 }
 
 /**
- * Return the last usage chunk in a released-v2/v3 embedded Assistant stream.
- * V3 retains this grammar, usage payloads and the inherited end-seed cut:
+ * Return the last usage chunk and its time in a released-v2/v3/v4 Assistant stream.
+ * V3/V4 retain this grammar, usage payloads and the inherited end-seed cut:
  * https://github.com/deepseek-ai/deepseek-harness/blob/fb2c4b9e698e30edb738bca4cf0618587db7d203/packages/session/session-format-v2-to-v3/src/codec.ts
  * Packed text/reasoning/tool-call runs cannot carry usage; the official
  * grammar keeps usage as `{type:'chunk', time, chunk:{type:'usage', usage}}`.
  */
-function lastEmbeddedUsage(stream: unknown): Record<string, unknown> | undefined {
+function lastEmbeddedUsage(stream: unknown): {
+  usage: Record<string, unknown>
+  time: number | undefined
+} | undefined {
   if (!Array.isArray(stream)) return undefined
-  let usage: Record<string, unknown> | undefined
+  let latest: ReturnType<typeof lastEmbeddedUsage>
   for (const member of stream) {
     const record = objectRecord(member)
     if (record?.type !== 'chunk') continue
     const chunk = objectRecord(record.chunk)
     if (chunk?.type !== 'usage') continue
     const sample = objectRecord(chunk.usage)
-    if (sample !== undefined) usage = sample
+    if (sample !== undefined) {
+      latest = {
+        usage: sample,
+        time: typeof record.time === 'number' && Number.isFinite(record.time) ? record.time : undefined,
+      }
+    }
   }
-  return usage
+  return latest
 }
 
 function messageRoute(data: Record<string, unknown> | undefined): {
@@ -251,10 +259,11 @@ export function parseSessionLog(
         if (!owned) break
         const data = objectRecord(event.data)
         if (formatVersion >= 2) {
+          const embedded = lastEmbeddedUsage(data?.stream)
           recordAttempt(
             data,
-            objectRecord(data?.usage) ?? lastEmbeddedUsage(data?.stream),
-            time,
+            objectRecord(data?.usage) ?? embedded?.usage,
+            embedded?.time ?? time,
             messageRoute(data),
           )
         } else {
@@ -265,7 +274,8 @@ export function parseSessionLog(
       case 'assistant/attempt': {
         if (formatVersion < 2 || !owned) break
         const data = objectRecord(event.data)
-        recordAttempt(data, lastEmbeddedUsage(data?.stream), time)
+        const embedded = lastEmbeddedUsage(data?.stream)
+        recordAttempt(data, embedded?.usage, embedded?.time ?? time)
         break
       }
       case 'llm/retry-started': {

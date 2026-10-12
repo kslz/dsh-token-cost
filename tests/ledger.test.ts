@@ -111,7 +111,7 @@ describe('SessionLedger', () => {
     try {
       const ledger = new SessionLedger(root, 'ledger.json')
       expect(await ledger.sync()).toMatchObject({ sessionCount: 1, recordCount: 1 })
-      expect(readFileSync(join(root, 'ledger.json'), 'utf8')).toContain('"version":6')
+      expect(readFileSync(join(root, 'ledger.json'), 'utf8')).toContain('"version":7')
     } finally {
       process.chdir(previousCwd)
     }
@@ -277,14 +277,22 @@ describe('SessionLedger', () => {
     }
   })
 
-  it.each([4, 5])('invalidates a version-%s ledger and persists a version-6 refold', async (version) => {
+  it.each([4, 5, 6])('invalidates a version-%s ledger and persists a version-7 usage-time refold', async (version) => {
     const root = mkdtempSync(join(tmpdir(), 'token-cost-ledger-version-test-'))
     const dir = join(root, '--tmp--', 'session-abc')
     const ledgerPath = join(root, 'ledger.json')
     const { mkdirSync } = await import('node:fs')
     mkdirSync(dir, { recursive: true })
-    const file = join(dir, 'session.jsonl.zstd')
-    copyFileSync(FIXTURE_A, file)
+    const file = join(dir, 'session.v4.jsonl')
+    writeFileSync(file, [
+      { type: 'session', version: 4, id: 'session-abc', createdAt: 1, isSeeded: false },
+      {
+        type: 'assistant/attempt', seq: 0, time: 20, data: {
+          turn: 1, step: 1,
+          stream: [{ type: 'chunk', time: 10, chunk: { type: 'usage', usage: { inputTokens: 100 } } }],
+        },
+      },
+    ].map((event) => JSON.stringify(event)).join('\n'), 'utf8')
     const info = statSync(file)
     writeFileSync(ledgerPath, JSON.stringify({
       version,
@@ -301,7 +309,7 @@ describe('SessionLedger', () => {
             lastActivity: 1,
           },
           records: [{
-            time: 1,
+            time: 20,
             turn: 1,
             step: 1,
             sessionId: 'session-abc',
@@ -320,7 +328,10 @@ describe('SessionLedger', () => {
 
     const ledger = new SessionLedger(root, ledgerPath)
     await ledger.sync()
-    expect(ledger.session('session-abc')!.records[0]!.inputTokens).toBe(100)
-    expect(JSON.parse(readFileSync(ledgerPath, 'utf8')).version).toBe(6)
+    expect(ledger.session('session-abc')!.records[0]).toMatchObject({ time: 10, inputTokens: 100 })
+    expect(JSON.parse(readFileSync(ledgerPath, 'utf8')).version).toBe(7)
+    const restarted = new SessionLedger(root, ledgerPath)
+    await restarted.sync()
+    expect(restarted.session('session-abc')!.records).toEqual(ledger.session('session-abc')!.records)
   })
 })
