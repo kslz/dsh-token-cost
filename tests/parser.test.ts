@@ -7,6 +7,8 @@ import { describe, expect, it } from 'vitest'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { parseSessionLog } from '../src/parser.ts'
+import { PRICE_SCHEMES, SCHEME_B_EFFECTIVE_FROM, priceRecord } from '../src/pricing.ts'
+import { dayLabelForTime } from '../src/routes.ts'
 
 const LOG = [
   JSON.stringify({ type: 'session', version: 0, id: 'session-abc', createdAt: 1_700_000_000_000, cwd: '/tmp/work' }),
@@ -155,6 +157,7 @@ describe('parseSessionLog', () => {
     const records = parseSessionLog(log, 'session-late-route', '').records
     expect(records).toHaveLength(1)
     expect(records[0]).toMatchObject({
+      time: 5,
       provider: 'provider-a',
       model: 'model-a',
       inputTokens: 3,
@@ -226,12 +229,14 @@ describe('parseSessionLog', () => {
     const records = parseSessionLog(log, 'session-v2-retry', '', version).records
     expect(records).toHaveLength(2)
     expect(records[0]).toMatchObject({
+      time: 4,
       provider: 'provider-a',
       model: 'model-a',
       inputTokens: 4,
       outputTokens: 2,
     })
     expect(records[1]).toMatchObject({
+      time: 8,
       provider: 'provider-message',
       model: 'model-message',
       inputTokens: 8,
@@ -258,8 +263,71 @@ describe('parseSessionLog', () => {
     ].map((event) => JSON.stringify(event)).join('\n')
 
     expect(parseSessionLog(log, 'session-v2-stream', '', version).records).toEqual([
-      expect.objectContaining({ inputTokens: 7, outputTokens: 4 }),
+      expect.objectContaining({ time: 3, inputTokens: 7, outputTokens: 4 }),
     ])
+  })
+
+  it.each([2, 3, 4])('prices and groups v%s usage by its last chunk time across settlement boundaries', (version) => {
+    const cases = [
+      {
+        usageTime: SCHEME_B_EFFECTIVE_FROM - 1,
+        settlementTime: SCHEME_B_EFFECTIVE_FROM + 1,
+        schemeId: 'scheme-a', costCny: 1, peak: null, day: '2026-08-16',
+      },
+      {
+        usageTime: Date.UTC(2026, 7, 17, 0, 59, 59, 999),
+        settlementTime: Date.UTC(2026, 7, 17, 1, 0, 0),
+        schemeId: 'scheme-b', costCny: 1.5, peak: false, day: '2026-08-17',
+      },
+    ]
+    for (const type of ['assistant/attempt', 'assistant/message']) {
+      for (const boundary of cases) {
+        const { usageTime, settlementTime, schemeId, costCny, peak, day } = boundary
+        const log = [
+          { type: 'session', version, id: 'session-usage-time', createdAt: 1, isSeeded: false },
+          { type: 'request/context', seq: 0, time: usageTime - 2, data: { provider: 'deepseek-official', model: 'deepseek-v4-flash' } },
+          {
+            type, seq: 1, time: settlementTime, data: {
+              turn: 1, step: 1,
+              stream: [
+                { type: 'chunk', time: usageTime - 1, chunk: { type: 'usage', usage: { inputTokens: 2 } } },
+                { type: 'chunk', time: usageTime, chunk: { type: 'usage', usage: { inputTokens: 1_000_000 } } },
+                { type: 'chunk', time: settlementTime, chunk: { type: 'finish', reason: { kind: 'stop' } } },
+              ],
+            },
+          },
+        ].map((event) => JSON.stringify(event)).join('\n')
+        const parsed = parseSessionLog(log, 'session-usage-time', '', version)
+        const record = parsed.records[0]!
+        expect(record.time).toBe(usageTime)
+        expect(record.inputTokens).toBe(1_000_000)
+        expect(priceRecord(record, PRICE_SCHEMES)).toMatchObject({ schemeId, costCny, peak })
+        expect(dayLabelForTime(record.time, 480)).toBe(day)
+        expect(parsed.meta.lastActivity).toBe(settlementTime)
+      }
+    }
+  })
+
+  it.each([2, 3, 4])('falls back to v%s settlement time when the selected usage chunk lacks a valid time', (version) => {
+    for (const type of ['assistant/attempt', 'assistant/message']) {
+      for (const time of [undefined, null, 'invalid']) {
+        const log = [
+          { type: 'session', version, id: 'session-usage-fallback', createdAt: 1, isSeeded: false },
+          {
+            type, seq: 0, time: 20, data: {
+              turn: 1, step: 1,
+              stream: [
+                { type: 'chunk', time: 10, chunk: { type: 'usage', usage: { inputTokens: 1 } } },
+                { type: 'chunk', time, chunk: { type: 'usage', usage: { inputTokens: 2 } } },
+              ],
+            },
+          },
+        ].map((event) => JSON.stringify(event)).join('\n')
+        expect(parseSessionLog(log, 'session-usage-fallback', '', version).records).toEqual([
+          expect.objectContaining({ time: 20, inputTokens: 2 }),
+        ])
+      }
+    }
   })
 
   it.each([2, 3, 4])('excludes a v%s fork prefix using the last inherited end-seed marker', (version) => {
